@@ -29,6 +29,9 @@ var _ = Describe("Manager", func() {
 		// nodes is a slice of all nodes to create during setup
 		nodes []*api.Node
 
+		// volumes is a slice of all volumes to create during setup
+		volumes []*api.Volume
+
 		pluginMaker *fakePluginMaker
 
 		// watch contains an event channel, which is produced by
@@ -67,6 +70,7 @@ var _ = Describe("Manager", func() {
 
 		plugins = []*api.CSIConfig_Plugin{}
 		nodes = []*api.Node{}
+		volumes = []*api.Volume{}
 
 		vm = NewManager(s)
 		vm.newPlugin = pluginMaker.newFakePlugin
@@ -88,6 +92,11 @@ var _ = Describe("Manager", func() {
 		err := s.Update(func(tx store.Tx) error {
 			for _, node := range nodes {
 				if err := store.CreateNode(tx, node); err != nil {
+					return err
+				}
+			}
+			for _, volume := range volumes {
+				if err := store.CreateVolume(tx, volume); err != nil {
 					return err
 				}
 			}
@@ -167,10 +176,40 @@ var _ = Describe("Manager", func() {
 					},
 				},
 			)
+
+			volumes = append(volumes,
+				&api.Volume{
+					ID: "volumeID1",
+					Spec: api.VolumeSpec{
+						Annotations: api.Annotations{
+							Name: "volume1",
+						},
+						Driver: &api.Driver{
+							Name: "newPlugin",
+						},
+					},
+				},
+				&api.Volume{
+					ID: "volumeID2",
+					Spec: api.VolumeSpec{
+						Annotations: api.Annotations{
+							Name: "volume2",
+						},
+						Driver: &api.Driver{
+							Name: "newPlugin",
+						},
+					},
+					VolumeInfo: &api.VolumeInfo{
+						VolumeID: "volumePluginID",
+					},
+				},
+			)
 		})
 
 		JustBeforeEach(func() {
-			vm.init()
+			// we can use context.Background because the context here is only
+			// used for logging.
+			vm.init(context.Background())
 		})
 
 		It("should create all Plugins", func() {
@@ -194,6 +233,10 @@ var _ = Describe("Manager", func() {
 				HaveKeyWithValue("nodeID1", "differentPluginNode1"),
 				HaveKeyWithValue("nodeID2", "differentPluginNode2"),
 			))
+		})
+
+		It("should enqueue all volumes", func() {
+			Expect(vm.pendingVolumes.Outstanding()).To(Equal(2))
 		})
 	})
 
@@ -266,7 +309,7 @@ var _ = Describe("Manager", func() {
 		})
 
 		JustBeforeEach(func() {
-			vm.init()
+			vm.init(context.Background())
 			volume := &api.Volume{
 				ID: "someVolume",
 				Spec: api.VolumeSpec{
@@ -307,7 +350,7 @@ var _ = Describe("Manager", func() {
 		})
 
 		It("should not requeue a successful volume", func() {
-			Expect(vm.pendingVolumes.outstanding).To(HaveLen(0))
+			Expect(vm.pendingVolumes.Outstanding()).To(Equal(0))
 		})
 	})
 
@@ -375,7 +418,7 @@ var _ = Describe("Manager", func() {
 		})
 
 		JustBeforeEach(func() {
-			vm.init()
+			vm.init(context.Background())
 		})
 
 		It("should add new nodes to the plugins", func() {
@@ -476,36 +519,63 @@ var _ = Describe("Manager", func() {
 		})
 	})
 
-	Describe("publishing volumes", func() {
+	Describe("publishing and unpublishing volumes", func() {
 		var (
-			task   *api.Task
-			v1, v2 *api.Volume
+			v1 *api.Volume
 		)
 		BeforeEach(func() {
 			plugins = append(plugins,
 				&api.CSIConfig_Plugin{
 					Name: "plug1",
 				},
-				&api.CSIConfig_Plugin{
-					Name: "plug2",
-				},
 			)
 
-			nodes = append(nodes, &api.Node{
-				ID: "node1",
-				Description: &api.NodeDescription{
-					CSIInfo: []*api.NodeCSIInfo{
-						{
-							PluginName: "plug1",
-							NodeID:     "plug1Node1",
-						},
-						{
-							PluginName: "plug2",
-							NodeID:     "plug2Node1",
+			nodes = append(nodes,
+				&api.Node{
+					ID: "node1",
+					Description: &api.NodeDescription{
+						CSIInfo: []*api.NodeCSIInfo{
+							{
+								PluginName: "plug1",
+								NodeID:     "plug1Node1",
+							},
 						},
 					},
 				},
-			})
+				&api.Node{
+					ID: "node2",
+					Description: &api.NodeDescription{
+						CSIInfo: []*api.NodeCSIInfo{
+							{
+								PluginName: "plug1",
+								NodeID:     "plug1Node2",
+							},
+						},
+					},
+				},
+				&api.Node{
+					ID: "node3",
+					Description: &api.NodeDescription{
+						CSIInfo: []*api.NodeCSIInfo{
+							{
+								PluginName: "plug1",
+								NodeID:     "plug1Node3",
+							},
+						},
+					},
+				},
+				&api.Node{
+					ID: "node4",
+					Description: &api.NodeDescription{
+						CSIInfo: []*api.NodeCSIInfo{
+							{
+								PluginName: "plug1",
+								NodeID:     "plug1Node4",
+							},
+						},
+					},
+				},
+			)
 
 			v1 = &api.Volume{
 				ID: "volumeID1",
@@ -521,86 +591,42 @@ var _ = Describe("Manager", func() {
 					VolumeContext: map[string]string{"foo": "bar"},
 					VolumeID:      "plug1VolID1",
 				},
-			}
-			v2 = &api.Volume{
-				ID: "volumeID2",
-				Spec: api.VolumeSpec{
-					Annotations: api.Annotations{
-						Name: "volume2",
-					},
-					Driver: &api.Driver{
-						Name: "plug2",
-					},
-				},
-				VolumeInfo: &api.VolumeInfo{
-					VolumeContext: map[string]string{"bas": "bat"},
-					VolumeID:      "plug2VolID1",
-				},
-			}
-
-			task = &api.Task{
-				ID:     "task1",
-				NodeID: "",
-				Spec: api.TaskSpec{
-					Runtime: &api.TaskSpec_Container{
-						Container: &api.ContainerSpec{
-							Mounts: []api.Mount{
-								{
-									Type:   api.MountTypeCSI,
-									Source: "volume1",
-									Target: "/home",
-								}, {
-									Type:   api.MountTypeCSI,
-									Source: "volume2",
-									Target: "/var",
-								},
-							},
-						},
+				PublishStatus: []*api.VolumePublishStatus{
+					{
+						NodeID: "node1",
+						State:  api.VolumePublishStatus_PENDING_PUBLISH,
+					}, {
+						NodeID:         "node3",
+						PublishContext: map[string]string{"unpublish": "thisone"},
+						State:          api.VolumePublishStatus_PENDING_UNPUBLISH,
+					}, {
+						NodeID: "node2",
+						State:  api.VolumePublishStatus_PENDING_PUBLISH,
+					}, {
+						NodeID:         "node4",
+						PublishContext: map[string]string{"unpublish": "thisone"},
+						State:          api.VolumePublishStatus_PENDING_UNPUBLISH,
 					},
 				},
-				Status: api.TaskStatus{
-					State: api.TaskStatePending,
-				},
 			}
-
-			err := s.Update(func(tx store.Tx) error {
-				if err := store.CreateTask(tx, task); err != nil {
-					return err
-				}
-				if err := store.CreateVolume(tx, v1); err != nil {
-					return err
-				}
-				return store.CreateVolume(tx, v2)
-			})
-			Expect(err).ToNot(HaveOccurred())
 		})
 
 		JustBeforeEach(func() {
-			vm.init()
+			vm.init(context.Background())
+
+			// do the creation after the initialization, so that the init does
+			// not enqueue the volumes for processing.
+			err := s.Update(func(tx store.Tx) error {
+				return store.CreateVolume(tx, v1)
+			})
+			Expect(err).ToNot(HaveOccurred())
 		})
 
 		It("should call ControllerPublishVolume for each pending PublishStatus", func() {
-			v1.PublishStatus = append(v1.PublishStatus, &api.VolumePublishStatus{
-				NodeID: "node1",
-				State:  api.VolumePublishStatus_PENDING_PUBLISH,
-			})
-			v2.PublishStatus = append(v2.PublishStatus, &api.VolumePublishStatus{
-				NodeID: "node1",
-				State:  api.VolumePublishStatus_PENDING_PUBLISH,
-			})
-
-			err := s.Update(func(tx store.Tx) error {
-				if err := store.UpdateVolume(tx, v1); err != nil {
-					return err
-				}
-				return store.UpdateVolume(tx, v2)
-			})
-			Expect(err).ToNot(HaveOccurred())
-
 			vm.processVolume(ctx, v1.ID, 0)
-			vm.processVolume(ctx, v2.ID, 0)
 
-			// quick one-off matcher composed from WithTransform
+			// node1 and node2 should be published, and node3 and node4 should
+			// be deleted
 			haveBeenPublished := func() GomegaMatcher {
 				return WithTransform(
 					func(v *api.Volume) []*api.VolumePublishStatus {
@@ -609,32 +635,85 @@ var _ = Describe("Manager", func() {
 						}
 						return v.PublishStatus
 					},
-					ConsistOf(&api.VolumePublishStatus{
-						NodeID:         "node1",
-						State:          api.VolumePublishStatus_PUBLISHED,
-						PublishContext: map[string]string{"faked": "yeah"},
-					}),
+					ConsistOf(
+						&api.VolumePublishStatus{
+							NodeID:         "node1",
+							State:          api.VolumePublishStatus_PUBLISHED,
+							PublishContext: map[string]string{"faked": "yeah"},
+						},
+						&api.VolumePublishStatus{
+							NodeID:         "node2",
+							State:          api.VolumePublishStatus_PUBLISHED,
+							PublishContext: map[string]string{"faked": "yeah"},
+						},
+					),
 				)
 			}
 
 			s.View(func(tx store.ReadTx) {
 				v1 = store.GetVolume(tx, v1.ID)
-				v2 = store.GetVolume(tx, v2.ID)
 			})
 			Expect(v1).To(haveBeenPublished())
-			Expect(v2).To(haveBeenPublished())
 
 			// verify, additionally, that ControllerPublishVolume has actually
 			// been called
 			Expect(pluginMaker.plugins["plug1"].volumesPublished[v1.ID]).To(
-				ConsistOf("node1"),
+				ConsistOf("node1", "node2"),
+			)
+			Expect(pluginMaker.plugins["plug1"].volumesUnpublished[v1.ID]).To(
+				ConsistOf("node3", "node4"),
 			)
 
-			Expect(pluginMaker.plugins["plug2"].volumesPublished[v2.ID]).To(
-				ConsistOf("node1"),
+			Expect(vm.pendingVolumes.Outstanding()).To(Equal(0))
+		})
+
+		It("should fail gracefully and only in part", func() {
+			v1.Spec.Annotations.Labels = map[string]string{
+				failPublishLabel: "node2,node4",
+			}
+			err := s.Update(func(tx store.Tx) error {
+				return store.UpdateVolume(tx, v1)
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			vm.processVolume(ctx, v1.ID, 0)
+
+			By("still updating and committing the volume to the store")
+			var (
+				updatedVolume                         *api.Volume
+				nodeStatus1, nodeStatus2, nodeStatus4 *api.VolumePublishStatus
 			)
 
-			Expect(vm.pendingVolumes.outstanding).To(HaveLen(0))
+			s.View(func(tx store.ReadTx) {
+				updatedVolume = store.GetVolume(tx, v1.ID)
+			})
+			Expect(updatedVolume).ToNot(BeNil())
+			Expect(updatedVolume.PublishStatus).To(HaveLen(3))
+
+			for _, status := range updatedVolume.PublishStatus {
+				switch status.NodeID {
+				case "node1":
+					nodeStatus1 = status
+				case "node2":
+					nodeStatus2 = status
+				case "node4":
+					nodeStatus4 = status
+				}
+			}
+
+			By("updating any PublishStatuses that succeed")
+			Expect(nodeStatus1.State).To(Equal(api.VolumePublishStatus_PUBLISHED))
+			Expect(nodeStatus1.Message).To(BeEmpty())
+
+			By("explaining the cause for the failure in the status message")
+			Expect(nodeStatus2.State).To(Equal(api.VolumePublishStatus_PENDING_PUBLISH))
+			Expect(nodeStatus2.Message).ToNot(BeEmpty())
+
+			Expect(nodeStatus4.State).To(Equal(api.VolumePublishStatus_PENDING_UNPUBLISH))
+			Expect(nodeStatus4.Message).ToNot(BeEmpty())
+
+			By("enqueuing the volume for a retry")
+			Expect(vm.pendingVolumes.Outstanding()).To(Equal(1))
 		})
 	})
 
@@ -646,6 +725,10 @@ var _ = Describe("Manager", func() {
 		})
 
 		JustBeforeEach(func() {
+			vm.init(context.Background())
+
+			// do creation after initialization to avoid init enqueuing the
+			// volume
 			volume := &api.Volume{
 				ID: "volumeID",
 				Spec: api.VolumeSpec{
@@ -666,7 +749,6 @@ var _ = Describe("Manager", func() {
 				return store.CreateVolume(tx, volume)
 			})
 			Expect(err).ToNot(HaveOccurred())
-			vm.init()
 		})
 
 		It("should delete the Volume", func() {
@@ -688,7 +770,9 @@ var _ = Describe("Manager", func() {
 			})
 			Expect(v).To(BeNil())
 
-			Expect(vm.pendingVolumes.outstanding).To(HaveLen(0))
+			// check that pendingVolumes is empty, which will not be the case
+			// if the delete operation failed.
+			Expect(vm.pendingVolumes.Outstanding()).To(Equal(0))
 		})
 
 		It("should not remove the volume from the store if DeleteVolume fails", func() {
@@ -717,7 +801,7 @@ var _ = Describe("Manager", func() {
 			// this will create a timer, but because it's only the first retry,
 			// it is a very short timer, and in any case, the entry remains in
 			// outstanding until it is plucked off by a call to wait.
-			Expect(vm.pendingVolumes.outstanding).To(HaveLen(1))
+			Expect(vm.pendingVolumes.Outstanding()).To(Equal(1))
 		})
 	})
 })

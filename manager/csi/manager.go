@@ -3,6 +3,7 @@ package csi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/docker/go-events"
@@ -11,6 +12,7 @@ import (
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/manager/state/store"
+	"github.com/docker/swarmkit/volumequeue"
 )
 
 type Manager struct {
@@ -34,7 +36,7 @@ type Manager struct {
 	cluster *api.Cluster
 	plugins map[string]Plugin
 
-	pendingVolumes *volumeQueue
+	pendingVolumes *volumequeue.VolumeQueue
 }
 
 func NewManager(s *store.MemoryStore) *Manager {
@@ -45,7 +47,7 @@ func NewManager(s *store.MemoryStore) *Manager {
 		newPlugin:      NewPlugin,
 		plugins:        map[string]Plugin{},
 		provider:       NewSecretProvider(s),
-		pendingVolumes: newVolumeQueue(),
+		pendingVolumes: volumequeue.NewVolumeQueue(),
 	}
 }
 
@@ -81,12 +83,12 @@ func (vm *Manager) run(pctx context.Context) {
 		return nil
 	})
 	if err != nil {
-		// TODO(dperny): log message
+		log.G(ctx).WithError(err).Error("error in store view and watch")
 		return
 	}
 	defer cancel()
 
-	vm.init()
+	vm.init(ctx)
 
 	// run a goroutine which periodically processes incoming volumes. the
 	// handle function will trigger processing every time new events come in
@@ -95,7 +97,7 @@ func (vm *Manager) run(pctx context.Context) {
 	doneProc := make(chan struct{})
 	go func() {
 		for {
-			id, attempt := vm.pendingVolumes.wait()
+			id, attempt := vm.pendingVolumes.Wait()
 			// this case occurs when the stop method has been called on
 			// pendingVolumes. stop is called on pendingVolumes when Stop is
 			// called on the CSI manager.
@@ -126,7 +128,7 @@ func (vm *Manager) run(pctx context.Context) {
 		case ev := <-watch:
 			vm.handleEvent(ev)
 		case <-vm.stopChan:
-			vm.pendingVolumes.stop()
+			vm.pendingVolumes.Stop()
 			return
 		}
 	}
@@ -145,26 +147,44 @@ func (vm *Manager) processVolume(ctx context.Context, id string, attempt uint) {
 	// errors.
 	if err != nil {
 		log.G(dctx).WithError(err).Info("error handling volume")
-		vm.pendingVolumes.enqueue(id, attempt+1)
+		vm.pendingVolumes.Enqueue(id, attempt+1)
 	}
 }
 
 // init does one-time setup work for the Manager, like creating all of
 // the Plugins and initializing the local state of the component.
-func (vm *Manager) init() {
+func (vm *Manager) init(ctx context.Context) {
 	vm.updatePlugins()
 
-	var nodes []*api.Node
+	var (
+		nodes   []*api.Node
+		volumes []*api.Volume
+	)
 	vm.store.View(func(tx store.ReadTx) {
 		var err error
 		nodes, err = store.FindNodes(tx, store.All)
 		if err != nil {
-			// TODO(dperny): log something
+			// this should *never happen*. Find only returns errors if the find
+			// by is invalid.
+			log.G(ctx).WithError(err).Error("error finding nodes")
+		}
+		volumes, err = store.FindVolumes(tx, store.All)
+		if err != nil {
+			// likewise, should never happen.
+			log.G(ctx).WithError(err).Error("error finding volumes")
 		}
 	})
 
 	for _, node := range nodes {
 		vm.handleNode(node)
+	}
+
+	// on initialization, we enqueue all of the Volumes. The easiest way to
+	// know if a Volume needs some work performed is to just pass it through
+	// the VolumeManager. If it doesn't need any work, then we will quickly
+	// skip by it. Otherwise, the needed work will be performed.
+	for _, volume := range volumes {
+		vm.enqueueVolume(volume.ID)
 	}
 }
 
@@ -204,14 +224,13 @@ func (vm *Manager) Stop() {
 }
 
 func (vm *Manager) handleEvent(ev events.Event) {
-	// TODO(dperny): instead of executing directly off of the event stream, add
-	// objects received to some kind of intermediate structure, so we can
-	// easily retry.
 	switch e := ev.(type) {
 	case api.EventUpdateCluster:
 		// TODO(dperny): verify that the Cluster in this event can never be nil
-		vm.cluster = e.Cluster
-		vm.updatePlugins()
+		if e.Cluster != nil {
+			vm.cluster = e.Cluster
+			vm.updatePlugins()
+		}
 	case api.EventCreateVolume:
 		vm.enqueueVolume(e.Volume.ID)
 	case api.EventUpdateVolume:
@@ -247,10 +266,11 @@ func (vm *Manager) createVolume(ctx context.Context, v *api.Volume) error {
 		return err
 	}
 
-	// TODO(dperny): handle error
 	err = vm.store.Update(func(tx store.Tx) error {
 		v2 := store.GetVolume(tx, v.ID)
-		// TODO(dperny): handle missing volume
+		// the volume should never be missing. I don't know of even any race
+		// condition that could result in this behavior. nevertheless, it's
+		// better to do this than to segfault.
 		if v2 == nil {
 			return nil
 		}
@@ -270,13 +290,15 @@ func (vm *Manager) createVolume(ctx context.Context, v *api.Volume) error {
 // response to a new Volume update event, not for a retry, the retry number is
 // always reset to 0.
 func (vm *Manager) enqueueVolume(id string) {
-	vm.pendingVolumes.enqueue(id, 0)
+	vm.pendingVolumes.Enqueue(id, 0)
 }
 
 // handleVolume processes a Volume. It determines if any relevant update has
 // occurred, and does the required work to handle that update if so.
 //
 // returns an error if handling the volume failed and needs to be retried.
+//
+// even if an error is returned, the store may still be updated.
 func (vm *Manager) handleVolume(ctx context.Context, id string) error {
 	var volume *api.Volume
 	vm.store.View(func(tx store.ReadTx) {
@@ -297,16 +319,58 @@ func (vm *Manager) handleVolume(ctx context.Context, id string) error {
 	}
 
 	updated := false
-	for _, status := range volume.PublishStatus {
-		if status.State == api.VolumePublishStatus_PENDING_PUBLISH {
+	// TODO(dperny): it's just pointers, but copying the entire PublishStatus
+	// on each update might be intensive.
+
+	// we take a copy of the PublishStatus slice, because if we succeed in an
+	// unpublish operation, we will delete that status from PublishStatus.
+	statuses := make([]*api.VolumePublishStatus, len(volume.PublishStatus))
+	copy(statuses, volume.PublishStatus)
+
+	// failedPublishOrUnpublish is a slice of nodes where publish or unpublish
+	// operations failed. Publishing or unpublishing a volume can succeed or
+	// fail in part. If any failures occur, we will add the node ID of the
+	// publish operation that failed to this slice. Then, at the end of this
+	// function, after we update the store, if there are any failed operations,
+	// we will still return an error.
+	failedPublishOrUnpublish := []string{}
+
+	// adjustIndex is the number of entries deleted from volume.PublishStatus.
+	// when we're deleting entries from volume.PublishStatus, the index of the
+	// entry in statuses will no longer match the index of the same entry in
+	// volume.PublishStatus. we subtract adjustIndex from i to get the index
+	// where the entry is found after taking into account the deleted entries.
+	adjustIndex := 0
+
+	for i, status := range statuses {
+		switch status.State {
+		case api.VolumePublishStatus_PENDING_PUBLISH:
 			plug := vm.plugins[volume.Spec.Driver.Name]
 			publishContext, err := plug.PublishVolume(ctx, volume, status.NodeID)
 			if err == nil {
-				// TODO(dperny): handle error
 				status.State = api.VolumePublishStatus_PUBLISHED
 				status.PublishContext = publishContext
-				updated = true
+				status.Message = ""
+			} else {
+				status.Message = fmt.Sprintf("error publishing volume: %v", err)
+				failedPublishOrUnpublish = append(failedPublishOrUnpublish, status.NodeID)
 			}
+			updated = true
+		case api.VolumePublishStatus_PENDING_UNPUBLISH:
+			plug := vm.plugins[volume.Spec.Driver.Name]
+			err := plug.UnpublishVolume(ctx, volume, status.NodeID)
+			if err == nil {
+				// if there is no error with unpublishing, then we delete the
+				// status from the statuses slice.
+				j := i - adjustIndex
+				volume.PublishStatus = append(volume.PublishStatus[:j], volume.PublishStatus[j+1:]...)
+				adjustIndex++
+			} else {
+				status.Message = fmt.Sprintf("error unpublishing volume: %v", err)
+				failedPublishOrUnpublish = append(failedPublishOrUnpublish, status.NodeID)
+			}
+
+			updated = true
 		}
 	}
 
@@ -316,8 +380,9 @@ func (vm *Manager) handleVolume(ctx context.Context, id string) error {
 			// volume object.
 			v := store.GetVolume(tx, volume.ID)
 			if v == nil {
-				// volume should never be deleted with pending publishes.
-				// either handle this error otherwise document why we don't.
+				// volume should never be deleted with pending publishes. if
+				// this does occur somehow, then we will just ignore it, rather
+				// than crashing.
 				return nil
 			}
 
@@ -326,6 +391,10 @@ func (vm *Manager) handleVolume(ctx context.Context, id string) error {
 		}); err != nil {
 			return err
 		}
+	}
+
+	if len(failedPublishOrUnpublish) > 0 {
+		return fmt.Errorf("error publishing or unpublishing to some nodes: %v", failedPublishOrUnpublish)
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package csi
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -12,9 +13,16 @@ import (
 	"github.com/docker/swarmkit/api"
 )
 
-// failDeleteLabel is a label set on a Volume to cause DeleteVolume on the fake
-// plugin to fail
-const failDeleteLabel = "fakes_fail_delete"
+const (
+	// failDeleteLabel is a label set on a Volume to cause DeleteVolume on the
+	// fake plugin to fail
+	failDeleteLabel = "fakes_fail_delete"
+
+	// failPublishLabel is a label set on a Volume to cause PublishVolume or
+	// UnpublishVolume to fail. The value of the label is the Node ID to fail
+	// on.
+	failPublishLabel = "fakes_fail_publish"
+)
 
 // volumes_fakes_test.go includes the fakes for unit-testing parts of the
 // volumes code.
@@ -77,10 +85,15 @@ func (f *fakeIdentityClient) Probe(ctx context.Context, in *csi.ProbeRequest, _ 
 type fakeControllerClient struct {
 	volumes    map[string]*csi.Volume
 	namesToIds map[string]string
+	publisher  bool
 	// createVolumeRequests is a log of all requests to CreateVolume.
 	createVolumeRequests []*csi.CreateVolumeRequest
 	// publishRequests is a log of all requests to ControllerPublishVolume
 	publishRequests []*csi.ControllerPublishVolumeRequest
+	// unpublishRequests is a log of all requests to ControllerUnpublishVolume
+	unpublishRequests []*csi.ControllerUnpublishVolumeRequest
+	// deleteRequests is a log of all requests to DeleteVolume
+	deleteRequests []*csi.DeleteVolumeRequest
 	// idCounter is a simple way to generate ids
 	idCounter int
 }
@@ -89,6 +102,7 @@ func newFakeControllerClient() *fakeControllerClient {
 	return &fakeControllerClient{
 		volumes:              map[string]*csi.Volume{},
 		namesToIds:           map[string]string{},
+		publisher:            true,
 		createVolumeRequests: []*csi.CreateVolumeRequest{},
 		publishRequests:      []*csi.ControllerPublishVolumeRequest{},
 	}
@@ -117,7 +131,9 @@ func (f *fakeControllerClient) CreateVolume(ctx context.Context, in *csi.CreateV
 }
 
 func (f *fakeControllerClient) DeleteVolume(ctx context.Context, in *csi.DeleteVolumeRequest, _ ...grpc.CallOption) (*csi.DeleteVolumeResponse, error) {
-	return nil, nil
+	f.deleteRequests = append(f.deleteRequests, in)
+	// deleteVolumeResponse intentionally left blank
+	return &csi.DeleteVolumeResponse{}, nil
 }
 
 func (f *fakeControllerClient) ControllerPublishVolume(ctx context.Context, in *csi.ControllerPublishVolumeRequest, _ ...grpc.CallOption) (*csi.ControllerPublishVolumeResponse, error) {
@@ -131,7 +147,8 @@ func (f *fakeControllerClient) ControllerPublishVolume(ctx context.Context, in *
 }
 
 func (f *fakeControllerClient) ControllerUnpublishVolume(ctx context.Context, in *csi.ControllerUnpublishVolumeRequest, _ ...grpc.CallOption) (*csi.ControllerUnpublishVolumeResponse, error) {
-	return nil, nil
+	f.unpublishRequests = append(f.unpublishRequests, in)
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
 func (f *fakeControllerClient) ValidateVolumeCapabilities(ctx context.Context, in *csi.ValidateVolumeCapabilitiesRequest, _ ...grpc.CallOption) (*csi.ValidateVolumeCapabilitiesResponse, error) {
@@ -147,7 +164,20 @@ func (f *fakeControllerClient) GetCapacity(ctx context.Context, in *csi.GetCapac
 }
 
 func (f *fakeControllerClient) ControllerGetCapabilities(ctx context.Context, in *csi.ControllerGetCapabilitiesRequest, _ ...grpc.CallOption) (*csi.ControllerGetCapabilitiesResponse, error) {
-	return nil, nil
+	caps := &csi.ControllerGetCapabilitiesResponse{}
+	if f.publisher {
+		caps.Capabilities = append(
+			caps.Capabilities,
+			&csi.ControllerServiceCapability{
+				Type: &csi.ControllerServiceCapability_Rpc{
+					Rpc: &csi.ControllerServiceCapability_RPC{
+						Type: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+					},
+				},
+			},
+		)
+	}
+	return caps, nil
 }
 
 func (f *fakeControllerClient) CreateSnapshot(ctx context.Context, in *csi.CreateSnapshotRequest, _ ...grpc.CallOption) (*csi.CreateSnapshotResponse, error) {
@@ -176,13 +206,14 @@ func (fpm *fakePluginMaker) newFakePlugin(config *api.CSIConfig_Plugin, provider
 	fpm.Lock()
 	defer fpm.Unlock()
 	p := &fakePlugin{
-		name:             config.Name,
-		socket:           config.ControllerSocket,
-		swarmToCSI:       map[string]string{},
-		volumesCreated:   map[string]*api.Volume{},
-		volumesDeleted:   []string{},
-		volumesPublished: map[string][]string{},
-		removedIDs:       map[string]struct{}{},
+		name:               config.Name,
+		socket:             config.ControllerSocket,
+		swarmToCSI:         map[string]string{},
+		volumesCreated:     map[string]*api.Volume{},
+		volumesDeleted:     []string{},
+		volumesPublished:   map[string][]string{},
+		volumesUnpublished: map[string][]string{},
+		removedIDs:         map[string]struct{}{},
 	}
 	fpm.plugins[config.Name] = p
 	return p
@@ -202,6 +233,9 @@ type fakePlugin struct {
 	// volumesPublished maps the ID of a Volume to the Nodes it was published
 	// to
 	volumesPublished map[string][]string
+	// volumesUnpublished maps the ID of a volume to the Nodes it has been
+	// unpublished from
+	volumesUnpublished map[string][]string
 }
 
 func (f *fakePlugin) CreateVolume(ctx context.Context, v *api.Volume) (*api.VolumeInfo, error) {
@@ -224,11 +258,25 @@ func (f *fakePlugin) DeleteVolume(ctx context.Context, v *api.Volume) error {
 }
 
 func (f *fakePlugin) PublishVolume(ctx context.Context, v *api.Volume, nodeID string) (map[string]string, error) {
+	if fail, ok := v.Spec.Annotations.Labels[failPublishLabel]; ok {
+		if strings.Contains(fail, nodeID) {
+			return nil, fmt.Errorf("failing publish on %s since the label is set", nodeID)
+		}
+	}
 	f.volumesPublished[v.ID] = append(f.volumesPublished[v.ID], nodeID)
-	// TODO(dperny): return somethign here
 	return map[string]string{
 		"faked": "yeah",
 	}, nil
+}
+
+func (f *fakePlugin) UnpublishVolume(ctx context.Context, v *api.Volume, nodeID string) error {
+	if fail, ok := v.Spec.Annotations.Labels[failPublishLabel]; ok {
+		if strings.Contains(fail, nodeID) {
+			return fmt.Errorf("failing unpublish on %s since the label is set", nodeID)
+		}
+	}
+	f.volumesUnpublished[v.ID] = append(f.volumesUnpublished[v.ID], nodeID)
+	return nil
 }
 
 func (f *fakePlugin) AddNode(swarmID, csiID string) {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/docker/swarmkit/agent/exec"
 	"github.com/docker/swarmkit/api"
+	"github.com/docker/swarmkit/volumequeue"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -15,20 +16,15 @@ const iterations = 25
 const interval = 100 * time.Millisecond
 
 func NewFakeManager() *volumes {
-	ctx, cancel := context.WithCancel(context.Background())
 	return &volumes{
-		m:                make(map[string]*api.VolumeAssignment),
-		plugins:          newFakePluginManager(),
-		tryVolumesCtx:    ctx,
-		tryVolumesCancel: cancel,
+		volumes:        map[string]volumeState{},
+		pendingVolumes: volumequeue.NewVolumeQueue(),
+		plugins:        newFakePluginManager(),
 	}
 }
 
 func TestTaskRestrictedVolumesProvider(t *testing.T) {
 	driver := "driver"
-
-	volumesManager := NewFakeManager()
-	volumesManager.plugins.Set([]*api.CSINodePlugin{{Name: driver}})
 
 	taskID := "taskID1"
 	type testCase struct {
@@ -56,15 +52,21 @@ func TestTaskRestrictedVolumesProvider(t *testing.T) {
 	for _, testCase := range testCases {
 		testCase := testCase
 		t.Run(testCase.desc, func(t *testing.T) {
-			v := &api.VolumeAssignment{
+			ctx := context.Background()
+
+			// create a new volumesManager each test.
+			volumesManager := NewFakeManager()
+			volumesManager.plugins.Set([]*api.CSINodePlugin{{Name: driver}})
+
+			v := api.VolumeAssignment{
 				ID:     testCase.volumeID,
 				Driver: &api.Driver{Name: driver},
 			}
-			// adding to the map happens in Add, not in tryAdd, so we do that
-			// manually
-			volumesManager.m[testCase.volumeID] = v
-			// call tryAddVolume in this test so that the add happens synchronously
-			volumesManager.tryAddVolume(context.Background(), v)
+
+			volumesManager.Add(v)
+			volumesManager.pendingVolumes.Wait()
+			volumesManager.tryVolume(ctx, v.ID, 0)
+
 			volumesGetter := Restrict(volumesManager, &api.Task{
 				ID: taskID,
 				Volumes: []*api.VolumeAttachment{
@@ -82,7 +84,6 @@ func TestTaskRestrictedVolumesProvider(t *testing.T) {
 				assert.NoError(t, err)
 				assert.NotEmpty(t, volume)
 			}
-			volumesManager.Reset()
 		})
 	}
 }
